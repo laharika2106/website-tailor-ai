@@ -1,0 +1,6 @@
+{
+  "name": "Website Tailor",
+  "description": "AI-powered website planning assistant. Turn your ideas into a clear, structured website plan with Nathan.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
