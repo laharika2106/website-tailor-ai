@@ -11,8 +11,7 @@ const CUSTOM_WEBHOOK_KEY = 'website_tailor_custom_webhook_url';
 const CHAT_HISTORY_KEY = 'website_tailor_chat_messages';
 
 /**
- * Retrieves the persistent session ID or generates a new one.
- * Session ID is maintained across messages and reloads.
+ * Get the existing session ID or create a new one.
  */
 export function getOrCreateSessionId(): string {
   try {
@@ -32,69 +31,51 @@ export function getOrCreateSessionId(): string {
 }
 
 /**
- * Resets the session ID for a brand-new conversation.
+ * Create a brand-new conversation session.
  */
 export function resetSessionId(): string {
   const newId = generateSessionId();
 
   try {
     localStorage.setItem(SESSION_STORAGE_KEY, newId);
-  } catch (e) {
-    console.warn(
-      'Failed to persist new session ID to localStorage',
-      e
-    );
+  } catch (error) {
+    console.warn('Failed to save session ID', error);
   }
 
   return newId;
 }
 
 /**
- * Generates a unique Website Tailor chat session ID.
+ * Generate a unique session ID.
  */
 function generateSessionId(): string {
-  const randomPart = Math.random()
-    .toString(36)
-    .substring(2, 10);
-
+  const randomPart = Math.random().toString(36).substring(2, 10);
   const timePart = Date.now().toString(36);
 
   return `wt_sess_${timePart}_${randomPart}`;
 }
 
 /**
- * Gets the configured n8n Chat webhook URL.
+ * Get n8n webhook URL.
  *
  * Priority:
- * 1. Custom localStorage override
+ * 1. localStorage custom webhook
  * 2. Vite environment variable
  */
 export function getWebhookUrl(): string {
   try {
-    const customUrl = localStorage.getItem(
-      CUSTOM_WEBHOOK_KEY
-    );
+    const customUrl = localStorage.getItem(CUSTOM_WEBHOOK_KEY);
 
-    if (
-      customUrl &&
-      customUrl.trim().length > 0
-    ) {
+    if (customUrl && customUrl.trim().length > 0) {
       return customUrl.trim();
     }
-  } catch (e) {
-    console.warn(
-      'Error reading custom webhook from storage',
-      e
-    );
+  } catch (error) {
+    console.warn('Could not read custom webhook URL', error);
   }
 
-  const envUrl =
-    import.meta.env.VITE_N8N_CHAT_WEBHOOK_URL;
+  const envUrl = import.meta.env.VITE_N8N_CHAT_WEBHOOK_URL;
 
-  if (
-    typeof envUrl === 'string' &&
-    envUrl.trim().length > 0
-  ) {
+  if (typeof envUrl === 'string' && envUrl.trim().length > 0) {
     return envUrl.trim();
   }
 
@@ -102,32 +83,22 @@ export function getWebhookUrl(): string {
 }
 
 /**
- * Sets or clears a custom webhook URL.
- *
- * Useful during development/testing.
+ * Save or remove a custom webhook URL.
  */
-export function setCustomWebhookUrl(
-  url: string
-): void {
+export function setCustomWebhookUrl(url: string): void {
   try {
     if (!url || url.trim().length === 0) {
       localStorage.removeItem(CUSTOM_WEBHOOK_KEY);
     } else {
-      localStorage.setItem(
-        CUSTOM_WEBHOOK_KEY,
-        url.trim()
-      );
+      localStorage.setItem(CUSTOM_WEBHOOK_KEY, url.trim());
     }
-  } catch (e) {
-    console.warn(
-      'Error writing custom webhook to storage',
-      e
-    );
+  } catch (error) {
+    console.warn('Could not save webhook URL', error);
   }
 }
 
 /**
- * Checks whether an n8n webhook is configured.
+ * Check whether a valid webhook URL exists.
  */
 export function isWebhookConfigured(): boolean {
   const url = getWebhookUrl();
@@ -140,39 +111,151 @@ export function isWebhookConfigured(): boolean {
 }
 
 /**
- * Sends a message to the n8n AI Agent.
+ * Remove Markdown code fences from AI JSON.
  *
- * Request:
+ * Handles:
+ *
+ * ```json
+ * {...}
+ * ```
+ *
+ * and
+ *
+ * ```
+ * {...}
+ * ```
+ */
+function cleanJsonString(value: string): string {
+  return value
+    .trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+}
+
+/**
+ * Attempt to parse Nathan's structured response.
+ *
+ * Nathan should return:
  *
  * {
- *   action: "sendMessage",
- *   sessionId: "...",
- *   chatInput: "..."
- * }
- *
- * Nathan can return either:
- *
- * 1. Normal text
- *
- * OR
- *
- * 2. Structured JSON:
- *
- * {
- *   "message": "I've updated your plan.",
+ *   "message": "I've updated your website plan.",
  *   "planUpdate": {
- *      "type": "Portfolio",
- *      "style": "Technical",
- *      "pages": [...]
+ *     "projectName": "...",
+ *     "type": "Portfolio",
+ *     "style": "Modern",
+ *     "pages": [...],
+ *     "features": [...]
  *   }
  * }
  */
-export async function sendN8nChatMessage(
-  params: {
-    chatInput: string;
-    sessionId: string;
+function parseNathanResponse(value: unknown): NathanResponse | null {
+  if (!value) {
+    return null;
   }
-): Promise<NathanResponse> {
+
+  /**
+   * CASE 1:
+   * n8n already returned an object.
+   */
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    const objectValue = value as Record<string, unknown>;
+
+    const messageCandidate =
+      objectValue.message ||
+      objectValue.output ||
+      objectValue.text ||
+      objectValue.response;
+
+    const planCandidate = objectValue.planUpdate;
+
+    if (
+      planCandidate &&
+      typeof planCandidate === 'object' &&
+      !Array.isArray(planCandidate)
+    ) {
+      return {
+        text:
+          typeof messageCandidate === 'string' &&
+          messageCandidate.trim().length > 0
+            ? messageCandidate.trim()
+            : 'Website plan updated.',
+        planUpdate: planCandidate as WebsitePlanUpdate,
+      };
+    }
+  }
+
+  /**
+   * CASE 2:
+   * n8n/OpenAI returned JSON inside a string.
+   */
+  if (typeof value === 'string') {
+    const cleaned = cleanJsonString(value);
+
+    if (!cleaned) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(cleaned);
+
+      if (parsed && typeof parsed === 'object') {
+        const messageCandidate =
+          parsed.message ||
+          parsed.output ||
+          parsed.text ||
+          parsed.response;
+
+        const planCandidate = parsed.planUpdate;
+
+        if (
+          planCandidate &&
+          typeof planCandidate === 'object' &&
+          !Array.isArray(planCandidate)
+        ) {
+          return {
+            text:
+              typeof messageCandidate === 'string' &&
+              messageCandidate.trim().length > 0
+                ? messageCandidate.trim()
+                : 'Website plan updated.',
+            planUpdate: planCandidate as WebsitePlanUpdate,
+          };
+        }
+
+        /**
+         * Valid JSON but no planUpdate.
+         */
+        if (
+          typeof messageCandidate === 'string' &&
+          messageCandidate.trim().length > 0
+        ) {
+          return {
+            text: messageCandidate.trim(),
+          };
+        }
+      }
+    } catch {
+      /**
+       * Not JSON.
+       *
+       * That's fine because Nathan can also have
+       * normal conversations.
+       */
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Send a message to Nathan through n8n.
+ */
+export async function sendN8nChatMessage(params: {
+  chatInput: string;
+  sessionId: string;
+}): Promise<NathanResponse> {
   const webhookUrl = getWebhookUrl();
 
   if (!webhookUrl) {
@@ -187,10 +270,12 @@ export async function sendN8nChatMessage(
 
   const controller = new AbortController();
 
-  const timeoutId = setTimeout(
-    () => controller.abort(),
-    35000
-  );
+  /**
+   * Give n8n/OpenAI enough time to answer.
+   */
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, 45000);
 
   try {
     const response = await fetch(webhookUrl, {
@@ -208,10 +293,11 @@ export async function sendN8nChatMessage(
 
     clearTimeout(timeoutId);
 
+    /**
+     * Handle HTTP errors.
+     */
     if (!response.ok) {
-      const errorText = await response
-        .text()
-        .catch(() => '');
+      const errorText = await response.text().catch(() => '');
 
       throw new Error(
         `HTTP_${response.status}: ${
@@ -224,18 +310,15 @@ export async function sendN8nChatMessage(
       response.headers.get('content-type') || '';
 
     /**
+     * ==========================================
      * JSON RESPONSE
+     * ==========================================
      */
-    if (
-      contentType.includes('application/json')
-    ) {
-      const rawData: unknown =
-        await response.json();
-
-      let data: N8nChatResponse;
+    if (contentType.includes('application/json')) {
+      const rawData: unknown = await response.json();
 
       /**
-       * n8n may occasionally return:
+       * n8n can sometimes return:
        *
        * [
        *   {
@@ -243,140 +326,112 @@ export async function sendN8nChatMessage(
        *   }
        * ]
        */
-      if (
-        Array.isArray(rawData) &&
-        rawData.length > 0
-      ) {
-        data =
-          rawData[0] as N8nChatResponse;
+      let data: N8nChatResponse;
+
+      if (Array.isArray(rawData) && rawData.length > 0) {
+        data = rawData[0] as N8nChatResponse;
       } else {
-        data =
-          rawData as N8nChatResponse;
+        data = rawData as N8nChatResponse;
       }
 
       /**
-       * Standard n8n response formats.
+       * ==========================================
+       * IMPORTANT FIX
+       * ==========================================
+       *
+       * Different n8n/model combinations may return
+       * Nathan's structured JSON through:
+       *
+       * output
+       * text
+       * response
+       * message
+       *
+       * We therefore check ALL of them.
        */
-      const textCandidate =
+
+      const candidates: unknown[] = [
+        data.output,
+        data.text,
+        data.response,
+        data.message,
+      ];
+
+      /**
+       * Also check the complete object because n8n
+       * may return planUpdate directly.
+       */
+      candidates.push(data);
+
+      for (const candidate of candidates) {
+        const parsed = parseNathanResponse(candidate);
+
+        if (parsed?.planUpdate) {
+          console.log(
+            'Nathan structured plan update:',
+            parsed.planUpdate
+          );
+
+          return parsed;
+        }
+      }
+
+      /**
+       * No structured planUpdate was found.
+       *
+       * Nathan may simply be chatting normally.
+       */
+      const normalTextCandidate =
         data.output ||
         data.text ||
         data.response ||
         data.message;
 
-      let text =
-        typeof textCandidate === 'string'
-          ? textCandidate.trim()
-          : '';
+      if (
+        typeof normalTextCandidate === 'string' &&
+        normalTextCandidate.trim().length > 0
+      ) {
+        /**
+         * It might still be JSON containing only
+         * a message.
+         */
+        const parsedNormal =
+          parseNathanResponse(normalTextCandidate);
 
-      let planUpdate:
-        | WebsitePlanUpdate
-        | undefined =
-        data.planUpdate;
+        if (parsedNormal) {
+          return parsedNormal;
+        }
+
+        return {
+          text: normalTextCandidate.trim(),
+        };
+      }
 
       /**
-       * IMPORTANT:
-       *
-       * The n8n AI Agent may return JSON
-       * INSIDE the "output" string.
-       *
-       * Example:
-       *
-       * {
-       *   "output":
-       *   "{\"message\":\"Done\",\"planUpdate\":{...}}"
-       * }
-       *
-       * Therefore we try to parse output.
+       * Unexpected but valid JSON response.
        */
-      if (
-        typeof data.output === 'string'
-      ) {
-        const output =
-          data.output.trim();
-
-        try {
-          /**
-           * Gemini sometimes wraps JSON in:
-           *
-           * ```json
-           * {...}
-           * ```
-           *
-           * Remove those fences first.
-           */
-          const cleanedOutput = output
-            .replace(
-              /^```json\s*/i,
-              ''
-            )
-            .replace(
-              /^```\s*/i,
-              ''
-            )
-            .replace(
-              /\s*```$/i,
-              ''
-            )
-            .trim();
-
-          const parsed =
-            JSON.parse(cleanedOutput);
-
-          if (
-            parsed &&
-            typeof parsed === 'object'
-          ) {
-            const parsedMessage =
-              parsed.message ||
-              parsed.output ||
-              parsed.text ||
-              parsed.response;
-
-            if (
-              typeof parsedMessage ===
-                'string' &&
-              parsedMessage.trim().length >
-                0
-            ) {
-              text =
-                parsedMessage.trim();
-            }
-
-            if (
-              parsed.planUpdate &&
-              typeof parsed.planUpdate ===
-                'object'
-            ) {
-              planUpdate =
-                parsed.planUpdate as WebsitePlanUpdate;
-            }
-          }
-        } catch {
-          /**
-           * Normal conversational output
-           * isn't JSON.
-           *
-           * That's completely fine.
-           */
-        }
-      }
-
-      if (!text) {
-        text =
-          'Website plan updated.';
-      }
-
       return {
-        text,
-        planUpdate,
+        text: 'Website plan updated.',
       };
     }
 
     /**
+     * ==========================================
      * PLAIN TEXT RESPONSE
+     * ==========================================
      */
-    const rawText =
-      await response.text();
+
+    const rawText = await response.text();
+
+    /**
+     * Even text/plain might contain JSON,
+     * so attempt to parse it.
+     */
+    const parsedText = parseNathanResponse(rawText);
+
+    if (parsedText) {
+      return parsedText;
+    }
 
     return {
       text:
@@ -387,9 +442,7 @@ export async function sendN8nChatMessage(
     clearTimeout(timeoutId);
 
     if (error instanceof Error) {
-      if (
-        error.name === 'AbortError'
-      ) {
+      if (error.name === 'AbortError') {
         throw new Error('TIMEOUT');
       }
 
@@ -401,23 +454,20 @@ export async function sendN8nChatMessage(
 }
 
 /**
- * Loads saved chat history.
+ * Load saved chat messages.
  */
 export function loadPersistedMessages():
   | ChatMessage[]
   | null {
   try {
     const raw =
-      localStorage.getItem(
-        CHAT_HISTORY_KEY
-      );
+      localStorage.getItem(CHAT_HISTORY_KEY);
 
     if (!raw) {
       return null;
     }
 
-    const parsed =
-      JSON.parse(raw);
+    const parsed = JSON.parse(raw);
 
     if (
       Array.isArray(parsed) &&
@@ -425,10 +475,10 @@ export function loadPersistedMessages():
     ) {
       return parsed;
     }
-  } catch (e) {
+  } catch (error) {
     console.warn(
-      'Failed to load chat history from localStorage',
-      e
+      'Failed to load chat history',
+      error
     );
   }
 
@@ -436,43 +486,41 @@ export function loadPersistedMessages():
 }
 
 /**
- * Saves chat history.
+ * Save chat messages.
  */
 export function savePersistedMessages(
   messages: ChatMessage[]
 ): void {
   try {
     /**
-     * Keep only the last 50 messages
-     * to prevent excessive localStorage usage.
+     * Keep only the latest 50 messages.
      */
-    const trimmed =
-      messages.slice(-50);
+    const trimmed = messages.slice(-50);
 
     localStorage.setItem(
       CHAT_HISTORY_KEY,
       JSON.stringify(trimmed)
     );
-  } catch (e) {
+  } catch (error) {
     console.warn(
-      'Failed to save chat history to localStorage',
-      e
+      'Failed to save chat history',
+      error
     );
   }
 }
 
 /**
- * Clears locally saved chat history.
+ * Remove saved chat history.
  */
 export function clearPersistedMessages(): void {
   try {
     localStorage.removeItem(
       CHAT_HISTORY_KEY
     );
-  } catch (e) {
+  } catch (error) {
     console.warn(
-      'Failed to clear chat history from localStorage',
-      e
+      'Failed to clear chat history',
+      error
     );
   }
 }
